@@ -1,0 +1,10 @@
+{
+  "Author": "FF14-automsg",
+  "Name": "DeepSeek 自动聊天回复",
+  "InternalName": "DeepSeekAutoReply",
+  "DalamudApiLevel": 15,
+  "ApplicableVersion": "any",
+  "Punchline": "使用 DeepSeek 自动回复可选的玩家聊天频道",
+  "Description": "通过可配置的 OpenAI 兼容接口在原频道回复，使用 SQLite 按角色、发送者和频道保存多轮对话。输入 /dsreply 设置，输入 /dstest 测试。",
+  "Tags": ["DeepSeek", "chat", "自动回复"]
+}
