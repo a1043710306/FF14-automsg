@@ -5,6 +5,12 @@ using System.Collections.Generic;
 
 namespace DeepSeekAutoReply;
 
+public enum ApiProtocol
+{
+    ChatCompletions,
+    Responses,
+}
+
 [Serializable]
 public sealed class Configuration : IPluginConfiguration
 {
@@ -14,6 +20,7 @@ public sealed class Configuration : IPluginConfiguration
     public int Version { get; set; } = 3;
     public string ApiAddress { get; set; } = "https://api.deepseek.com";
     public string ApiToken { get; set; } = string.Empty;
+    public ApiProtocol Protocol { get; set; } = ApiProtocol.ChatCompletions;
     public string ModelId { get; set; } = "deepseek-flash";
     public string SystemPrompt { get; set; } = DefaultSystemPrompt;
     public bool ReplyToParty { get; set; } = true;
@@ -23,6 +30,7 @@ public sealed class Configuration : IPluginConfiguration
     public int CooldownSeconds { get; set; } = 8;
     public int MaxReplyCharacters { get; set; } = 120;
     public int HistoryTurns { get; set; } = ConversationCache.MaxTurns;
+    public bool LoggingEnabled { get; set; } = true;
 
     internal void Upgrade()
     {

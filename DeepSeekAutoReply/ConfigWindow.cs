@@ -14,12 +14,14 @@ internal sealed class ConfigWindow : Window
     private readonly Plugin plugin;
     private string apiAddress;
     private string token;
+    private ApiProtocol protocol;
     private string model;
     private string prompt;
     private readonly HashSet<XivChatType> channels;
     private int cooldown;
     private int maxCharacters;
     private int historyTurns;
+    private bool loggingEnabled;
     private string status = string.Empty;
     private Task<bool>? clearingHistory;
 
@@ -28,6 +30,7 @@ internal sealed class ConfigWindow : Window
         this.plugin = plugin;
         apiAddress = config.ApiAddress ?? string.Empty;
         token = config.ApiToken ?? string.Empty;
+        protocol = config.Protocol == ApiProtocol.Responses ? ApiProtocol.Responses : ApiProtocol.ChatCompletions;
         model = config.ModelId ?? string.Empty;
         prompt = config.SystemPrompt ?? string.Empty;
         channels = ChatRouting.AllChannels.Where(option => ChatRouting.GetEnabledChannel(option.Type, config) is not null)
@@ -35,6 +38,7 @@ internal sealed class ConfigWindow : Window
         cooldown = Math.Clamp(config.CooldownSeconds, 0, 300);
         maxCharacters = Math.Clamp(config.MaxReplyCharacters, 20, 500);
         historyTurns = Math.Clamp(config.HistoryTurns, 0, ConversationCache.MaxTurns);
+        loggingEnabled = config.LoggingEnabled;
         Size = new Vector2(645, 610);
         SizeCondition = ImGuiCond.FirstUseEver;
     }
@@ -44,6 +48,15 @@ internal sealed class ConfigWindow : Window
         ImGui.InputText("API 地址", ref apiAddress, 1024);
         ImGui.InputText("Token", ref token, 1024, ImGuiInputTextFlags.Password);
         ImGui.InputText("模型 ID", ref model, 256);
+        if (ImGui.BeginCombo("AI 协议", protocol == ApiProtocol.Responses ? "Responses" : "Chat Completions"))
+        {
+            if (ImGui.Selectable("Chat Completions", protocol == ApiProtocol.ChatCompletions))
+                protocol = ApiProtocol.ChatCompletions;
+            if (ImGui.Selectable("Responses", protocol == ApiProtocol.Responses))
+                protocol = ApiProtocol.Responses;
+            ImGui.EndCombo();
+        }
+
         ImGui.Separator();
         ImGui.TextUnformatted("自动回复频道");
         ImGui.SameLine();
@@ -64,6 +77,7 @@ internal sealed class ConfigWindow : Window
         ImGui.SliderInt("同一频道或私聊对象冷却（秒）", ref cooldown, 0, 300);
         ImGui.SliderInt("最大回复字数", ref maxCharacters, 20, 500);
         ImGui.InputInt("缓存对话轮数（0–1000）", ref historyTurns);
+        ImGui.Checkbox("启用插件日志", ref loggingEnabled);
         if (ImGui.SmallButton("清空对话缓存") && clearingHistory is null)
         {
             clearingHistory = plugin.ClearConversationHistory();
@@ -113,6 +127,7 @@ internal sealed class ConfigWindow : Window
         {
             ApiAddress = apiAddress.Trim(),
             ApiToken = token.Trim(),
+            Protocol = protocol,
             ModelId = model.Trim(),
             SystemPrompt = prompt,
             ReplyToParty = channels.Contains(XivChatType.Party),
@@ -122,6 +137,7 @@ internal sealed class ConfigWindow : Window
             CooldownSeconds = cooldown,
             MaxReplyCharacters = maxCharacters,
             HistoryTurns = historyTurns,
+            LoggingEnabled = loggingEnabled,
         };
         if (updated.ApiToken.Length > 0 && channels.Count > 0
             && !ApiSettings.TryCreate(updated, out _, out status))

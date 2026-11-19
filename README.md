@@ -16,9 +16,11 @@ dotnet build .\DeepSeekAutoReply\DeepSeekAutoReply.csproj -c Release
 ## 配置自动回复
 
 1. 输入 `/dsreply` 打开设置。
-2. 填写 **API 地址**、**Token**、**模型 ID**。默认地址是 `https://api.deepseek.com`，默认模型是 `deepseek-flash`。API 地址可填基础地址或完整的 `/chat/completions` 地址。Token 填原始密钥，模型 ID 填服务商提供的值。
+2. 填写 **API 地址**、**Token**、**模型 ID**，并选择 **AI 协议**。默认地址是 `https://api.deepseek.com`，默认模型是 `deepseek-flash`。Token 填原始密钥，模型 ID 填服务商提供的值。
 3. 在**自动回复频道**中选择需要回复的频道，也可用「全选」或「全关」。新安装时默认开启小队、团队和私聊。升级保留原有选择，新增频道默认关闭。
 4. 在**系统提示词**里填写你希望的回复风格，可使用多行。也可调整冷却时间和回复长度。点击保存后生效。
+
+**Chat Completions** 请求 `/chat/completions`，**Responses** 请求 `/responses`。填写基础地址（如 `https://api.deepseek.com` 或带 `/v1` 的兼容地址）即可自动补全。也可填写完整端点，切换协议时插件会更新末尾端点。旧配置默认沿用 Chat Completions。两种协议都可用 `/dstest` 测试。[DeepSeek Responses 文档](https://api-docs.deepseek.com/api/create-response) · [OpenAI Responses 指南](https://developers.openai.com/api/docs/guides/migrate-to-responses)
 
 插件跳过当前角色自己发出的消息。说话、呼喊和喊话的回复会在原地图和实例内提交。Token 保存在本机 Dalamud 插件配置文件中。接口失败时可在 `/xllog` 查看错误，日志省略密钥和聊天内容。
 
@@ -28,10 +30,12 @@ dotnet build .\DeepSeekAutoReply\DeepSeekAutoReply.csproj -c Release
 
 默认每个会话缓存最近 1000 轮，每轮包含一条来信和一条回复。在 `/dsreply` 可设置 0–1000 轮。旧版默认 6 轮升级为 1000 轮，其余已保存的设置保留。设为 0 并保存会关闭并清空缓存。
 
-历史存放在 Dalamud 插件配置目录下的 `conversation-cache.sqlite3`，按当前游戏角色隔离，登出或重启后仍可使用。「清空对话缓存」会清除数据库内所有角色的历史，更换已保存的 API 配置或系统提示词也会清空历史。每个角色最多保留 128 个最近更新的会话。第三方模型的上下文上限由供应商决定，可按需调低轮数。
+历史存放在 Dalamud 插件配置目录下的 `conversation-cache.sqlite3`，按当前游戏角色隔离，登出或重启后仍可使用。「清空对话缓存」会清除数据库内所有角色的历史。更换已保存的 API 配置（含协议）或系统提示词也会清空历史。每个角色最多保留 128 个最近更新的会话。第三方模型的上下文上限由供应商决定，可按需调低轮数。
 
 测试小队回复时，保存开启「小队（含跨服）」的配置，请队友发一条 `/p` 消息。打开 `/xllog` 并显示 Debug 级别，即可查看 `[Party]` 或 `[CrossParty]` 的请求、队伍状态和提交结果。
 
-保存 API 配置后，在游戏里输入 `/dstest`，或输入 `/dstest 大肥鱼在吗？` 来指定测试文本。测试用已保存的系统提示词请求模型，把回复或错误显示在自己的聊天框里。连续输入两次可测试多轮回复。打开 `/xllog` 搜索 `[dstest]` 可查看附带的历史轮数、HTTP 状态、Content-Type、响应大小、识别出的正文类型及 JSON 解析位置。
+保存 API 配置后，在游戏里输入 `/dstest`，或输入 `/dstest 大肥鱼在吗？` 来指定测试文本。测试用已保存的系统提示词请求模型，把回复或错误显示在自己的聊天框里。连续输入两次可测试多轮回复。打开 `/xllog` 的 Debug 级别，搜索 `SQLite` 可查看数据库路径、读取轮数和写入或裁剪结果，搜索 `[dstest]` 可查看 HTTP 状态和响应诊断。日志省略昵称、消息正文和 Token。
+
+在 `/dsreply` 中可以关闭「启用插件日志」，保存后停止在 `/xllog` 写入此插件的调试和警告日志。`/dstest` 仍会在本地聊天框显示结果。
 
 [DalamudPluginsCN-Dev 开发文档](https://github.com/gamous/DalamudPluginsCN-Dev#开发-contribution) · [DeepSeek API 文档](https://api-docs.deepseek.com/)

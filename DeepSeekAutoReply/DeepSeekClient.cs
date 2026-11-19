@@ -11,8 +11,10 @@ using System.Threading.Tasks;
 
 namespace DeepSeekAutoReply;
 
-internal sealed record ApiSettings(Uri Endpoint, string Token, string Model, string SystemPrompt)
+internal sealed record ApiSettings(Uri Endpoint, string Token, string Model, string SystemPrompt, ApiProtocol Protocol)
 {
+    private const string ChatEndpoint = "/chat/completions";
+    private const string ResponsesEndpoint = "/responses";
     public string HistoryProfile { get; } = Convert.ToHexString(SHA256.HashData(
         JsonSerializer.SerializeToUtf8Bytes(new[] { Endpoint.AbsoluteUri, Token, Model, SystemPrompt })));
 
@@ -43,14 +45,23 @@ internal sealed record ApiSettings(Uri Endpoint, string Token, string Model, str
             return false;
         }
 
+        if (config.Protocol is not (ApiProtocol.ChatCompletions or ApiProtocol.Responses))
+        {
+            error = "请选择有效的 AI 协议。";
+            return false;
+        }
+
         var path = uri.AbsolutePath.TrimEnd('/');
+        var suffix = config.Protocol == ApiProtocol.Responses ? ResponsesEndpoint : ChatEndpoint;
+        var otherSuffix = config.Protocol == ApiProtocol.Responses ? ChatEndpoint : ResponsesEndpoint;
+        if (path.EndsWith(otherSuffix, StringComparison.OrdinalIgnoreCase))
+            path = path[..^otherSuffix.Length];
+
         var endpoint = new UriBuilder(uri)
         {
-            Path = path.EndsWith("/chat/completions", StringComparison.Ordinal)
-                ? path
-                : path + "/chat/completions",
+            Path = path.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) ? path : path + suffix,
         }.Uri;
-        settings = new ApiSettings(endpoint, token, model, config.SystemPrompt ?? string.Empty);
+        settings = new ApiSettings(endpoint, token, model, config.SystemPrompt ?? string.Empty, config.Protocol);
         error = string.Empty;
         return true;
     }
@@ -74,26 +85,43 @@ internal sealed class DeepSeekClient : IDisposable
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, settings.Endpoint);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.Token);
-        var useOfficialFlash = settings.Endpoint.IdnHost == "api.deepseek.com" && settings.Model == "deepseek-flash";
-        var messages = new List<ApiMessage>((history?.Count ?? 0) * 2 + 2) { new("system", settings.SystemPrompt) };
+        var isOfficialDeepSeek = settings.Endpoint.IdnHost == "api.deepseek.com";
+        var useOfficialFlash = isOfficialDeepSeek && settings.Model == "deepseek-flash";
+        var useResponses = settings.Protocol == ApiProtocol.Responses;
+        var messageType = useResponses ? "message" : null;
+        var messages = new List<ApiMessage>((history?.Count ?? 0) * 2 + 2);
+        if (!useResponses)
+            messages.Add(new ApiMessage("system", settings.SystemPrompt));
+
         if (history is not null)
         {
             foreach (var turn in history)
             {
-                messages.Add(new ApiMessage("user", turn.User));
-                messages.Add(new ApiMessage("assistant", turn.Assistant));
+                messages.Add(new ApiMessage("user", turn.User, messageType));
+                messages.Add(new ApiMessage("assistant", turn.Assistant, messageType));
             }
         }
-        messages.Add(new ApiMessage("user", incoming));
+        messages.Add(new ApiMessage("user", incoming, messageType));
 
-        request.Content = JsonContent.Create(new
-        {
-            model = settings.Model,
-            max_tokens = 1024,
-            stream = false,
-            thinking = useOfficialFlash ? new { type = "disabled" } : null,
-            messages,
-        }, options: RequestJsonOptions);
+        request.Content = useResponses
+            ? JsonContent.Create(new
+            {
+                model = settings.Model,
+                instructions = string.IsNullOrWhiteSpace(settings.SystemPrompt) ? null : settings.SystemPrompt,
+                input = messages,
+                max_output_tokens = 1024,
+                stream = false,
+                store = isOfficialDeepSeek ? (bool?)null : false,
+                reasoning = useOfficialFlash ? new { effort = "none" } : null,
+            }, options: RequestJsonOptions)
+            : JsonContent.Create(new
+            {
+                model = settings.Model,
+                max_tokens = 1024,
+                stream = false,
+                thinking = useOfficialFlash ? new { type = "disabled" } : null,
+                messages,
+            }, options: RequestJsonOptions);
         using var response = await http.SendAsync(request, cancellationToken).ConfigureAwait(false);
         var body = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
         var jsonBytes = body.AsMemory(body.AsSpan().StartsWith("\uFEFF"u8) ? 3 : 0);
@@ -107,7 +135,11 @@ internal sealed class DeepSeekClient : IDisposable
         try
         {
             using var json = JsonDocument.Parse(jsonBytes);
-            var content = ReadReply(json.RootElement, details);
+            var root = json.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                throw new ApiResponseException(details, "响应 JSON 的根节点不是对象");
+
+            var content = useResponses ? ReadResponsesReply(root, details) : ReadChatReply(root, details);
             return new ApiReply(content, details);
         }
         catch (JsonException ex)
@@ -121,11 +153,8 @@ internal sealed class DeepSeekClient : IDisposable
 
     public void Dispose() => http.Dispose();
 
-    private static string ReadReply(JsonElement root, ApiResponseDetails details)
+    private static string ReadChatReply(JsonElement root, ApiResponseDetails details)
     {
-        if (root.ValueKind != JsonValueKind.Object)
-            throw new ApiResponseException(details, "响应 JSON 的根节点不是对象");
-
         if (!root.TryGetProperty("choices", out var choices) || choices.ValueKind != JsonValueKind.Array)
         {
             var reason = root.TryGetProperty("error", out _) ? "响应包含 error 字段" : "响应缺少 choices 数组";
@@ -150,6 +179,61 @@ internal sealed class DeepSeekClient : IDisposable
         return reply;
     }
 
+    private static string ReadResponsesReply(JsonElement root, ApiResponseDetails details)
+    {
+        var status = StringField(root, "status");
+        if (status is "failed" or "cancelled" || root.TryGetProperty("error", out var error)
+            && error.ValueKind != JsonValueKind.Null)
+            throw new ApiResponseException(details, "Responses API 报告请求失败");
+
+        if (status is "queued" or "in_progress")
+            throw new ApiResponseException(details, "Responses API 尚未生成最终回复");
+
+        if (status == "incomplete")
+        {
+            var reason = root.TryGetProperty("incomplete_details", out var incomplete) ? StringField(incomplete, "reason") : null;
+            var suffix = reason is "max_output_tokens" or "content_filter" ? $"（{reason}）" : string.Empty;
+            throw new ApiResponseException(details, $"Responses API 返回了未完成的回复{suffix}");
+        }
+
+        var parts = new List<string>();
+        var refused = false;
+        if (root.TryGetProperty("output", out var output) && output.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in output.EnumerateArray())
+            {
+                if (StringField(item, "type") != "message" || StringField(item, "role") != "assistant"
+                    || !item.TryGetProperty("content", out var content) || content.ValueKind != JsonValueKind.Array)
+                    continue;
+
+                foreach (var part in content.EnumerateArray())
+                {
+                    var type = StringField(part, "type");
+                    var text = type == "output_text" ? StringField(part, "text") : null;
+                    if (!string.IsNullOrWhiteSpace(text))
+                        parts.Add(text);
+                    if (type == "refusal")
+                        refused = true;
+                }
+            }
+        }
+
+        if (parts.Count > 0)
+            return string.Join("\n", parts);
+        if (refused)
+            throw new ApiResponseException(details, "模型拒绝生成回复");
+
+        var fallback = StringField(root, "output_text");
+        if (!string.IsNullOrWhiteSpace(fallback))
+            return fallback;
+
+        throw new ApiResponseException(details, "Responses 回复中缺少可用的 output_text");
+    }
+
+    private static string? StringField(JsonElement element, string name) =>
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value)
+        && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+
     private static string DescribeBody(ReadOnlySpan<byte> body, string contentType)
     {
         while (!body.IsEmpty && body[0] is (byte)' ' or (byte)'\t' or (byte)'\r' or (byte)'\n')
@@ -168,7 +252,7 @@ internal sealed class DeepSeekClient : IDisposable
     }
 
     private sealed record ApiMessage([property: JsonPropertyName("role")] string Role,
-        [property: JsonPropertyName("content")] string Content);
+        [property: JsonPropertyName("content")] string Content, [property: JsonPropertyName("type")] string? Type = null);
 }
 
 internal sealed record ApiReply(string Text, ApiResponseDetails Response);

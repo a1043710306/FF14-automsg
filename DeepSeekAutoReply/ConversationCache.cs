@@ -38,6 +38,8 @@ internal sealed class ConversationCache(string databasePath)
     private Task previousOperation = Task.CompletedTask;
     private SQLiteConnection? database;
 
+    public string DatabasePath => databasePath;
+
     public Task<ConversationTurn[]> ReadAsync(ConversationScope? scope, int maxTurns)
     {
         if (scope is null || maxTurns <= 0)
@@ -78,7 +80,8 @@ internal sealed class ConversationCache(string databasePath)
             var trimmedTurns = 0;
             var evictedConversations = 0;
             var replacedContext = false;
-            GetDatabase().RunInTransaction(connection =>
+            var connection = GetDatabase();
+            connection.RunInTransaction(() =>
             {
                 connection.Execute("INSERT OR IGNORE INTO conversations (owner, conversation_key, context) VALUES (?, ?, ?)",
                     owner, key, context);
@@ -88,20 +91,20 @@ internal sealed class ConversationCache(string databasePath)
                 if (replacedContext)
                     connection.Execute("DELETE FROM conversation_turns WHERE owner = ? AND conversation_key = ?", owner, key);
 
-                trimmedTurns = connection.Execute(
+                connection.Execute(
                     "INSERT INTO conversation_turns (owner, conversation_key, user_text, assistant_text) VALUES (?, ?, ?, ?)",
                     owner, key, user, assistant);
-                evictedConversations = connection.Execute(
+                connection.Execute(
                     "UPDATE conversations SET context = ?, last_turn_id = last_insert_rowid() WHERE owner = ? AND conversation_key = ?",
                     context, owner, key);
-                connection.Execute(
+                trimmedTurns = connection.Execute(
                     """
                     DELETE FROM conversation_turns
                     WHERE owner = ? AND conversation_key = ?
                         AND id < (SELECT id FROM conversation_turns WHERE owner = ? AND conversation_key = ?
                             ORDER BY id DESC LIMIT 1 OFFSET ?)
                     """, owner, key, owner, key, limit - 1);
-                connection.Execute(
+                evictedConversations = connection.Execute(
                     """
                     DELETE FROM conversations WHERE owner = ? AND conversation_key IN (
                         SELECT conversation_key FROM conversations WHERE owner = ?

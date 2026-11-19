@@ -46,6 +46,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly WindowSystem windows = new("DeepSeekAutoReply");
     private readonly ConfigWindow configWindow;
     private Configuration configuration;
+    private volatile bool loggingEnabled;
     private ApiSettings? apiSettings;
     private CancellationTokenSource requests = new();
     private int revision;
@@ -55,7 +56,9 @@ public sealed class Plugin : IDalamudPlugin
         configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         configuration.Upgrade();
         ApplyConfiguration();
-        conversations = new ConversationCache(Path.Combine(PluginInterface.ConfigDirectory.FullName, "conversation-cache.sqlite3"));
+        var databasePath = Path.Combine(PluginInterface.ConfigDirectory.FullName, "conversation-cache.sqlite3");
+        conversations = new ConversationCache(databasePath);
+        DebugLog($"SQLite 对话缓存路径 {databasePath}");
         configWindow = new ConfigWindow(this, configuration);
         windows.AddWindow(configWindow);
         CommandManager.AddHandler(CommandName, new CommandInfo((_, _) => configWindow.Toggle())
@@ -94,8 +97,11 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.SavePluginConfig(updated);
         var previousApiSettings = apiSettings;
         var previousLimit = configuration.HistoryTurns;
+        var wasLoggingEnabled = loggingEnabled;
         configuration = updated;
         ApplyConfiguration();
+        if (!wasLoggingEnabled && loggingEnabled)
+            DebugLog($"SQLite 对话缓存路径 {conversations.DatabasePath}");
         ResetRequests();
         if (!Equals(previousApiSettings, apiSettings))
             _ = ObserveCacheOperationAsync(conversations.ClearAsync(), "清空");
@@ -111,6 +117,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private void ApplyConfiguration()
     {
+        loggingEnabled = configuration.LoggingEnabled;
         apiSettings = ApiSettings.TryCreate(configuration, out var settings, out _) ? settings : null;
     }
 
@@ -163,13 +170,13 @@ public sealed class Plugin : IDalamudPlugin
         if (ChatRouting.GetEnabledChannel(type, configuration) is not { } channel)
         {
             if (type is XivChatType.Party or XivChatType.CrossParty)
-                Log.Debug($"[{type}] 小队自动回复未启用");
+                DebugLog($"[{type}] 小队自动回复未启用");
             return;
         }
 
         if (message.SourceKind == XivChatRelationKind.LocalPlayer)
         {
-            Log.Debug($"[{type}] 跳过自己发送的消息");
+            DebugLog($"[{type}] 跳过自己发送的消息");
             return;
         }
 
@@ -179,7 +186,7 @@ public sealed class Plugin : IDalamudPlugin
 
         if (apiSettings is not { } settings)
         {
-            Log.Debug($"[{type}] 已收到消息，API 配置未就绪");
+            DebugLog($"[{type}] 已收到消息，API 配置未就绪");
             return;
         }
 
@@ -188,21 +195,21 @@ public sealed class Plugin : IDalamudPlugin
         var senderName = isTell || localPlayerLoaded ? ChatSender.ResolveOriginalSender(message) : null;
         if (isTell && senderName is null)
         {
-            Log.Debug($"[{type}] 找不到可用于 /tell 的发送者");
+            DebugLog($"[{type}] 找不到可用于 /tell 的发送者");
             return;
         }
 
         if (localPlayerLoaded && senderName is not null
             && ChatSender.IsLocalSender(senderName, PlayerState.CharacterName, PlayerState.HomeWorld.ValueNullable?.Name.ToString()))
         {
-            Log.Debug($"[{type}] 发送者是本地玩家，跳过");
+            DebugLog($"[{type}] 发送者是本地玩家，跳过");
             return;
         }
 
         var key = isTell ? $"tell:{senderName}" : channel.ToString();
         if (pending.Contains(key))
         {
-            Log.Debug($"[{type}] 已有一条回复正在生成");
+            DebugLog($"[{type}] 已有一条回复正在生成");
             return;
         }
 
@@ -210,7 +217,7 @@ public sealed class Plugin : IDalamudPlugin
         var cooldown = Math.Clamp(configuration.CooldownSeconds, 0, 300) * 1000L;
         if (lastRequests.TryGetValue(key, out var previous) && now - previous < cooldown)
         {
-            Log.Debug($"[{type}] 自动回复冷却中");
+            DebugLog($"[{type}] 自动回复冷却中");
             return;
         }
 
@@ -218,7 +225,7 @@ public sealed class Plugin : IDalamudPlugin
         var group = usesGroup ? CaptureGroup(type) : null;
         if (usesGroup && group is null)
         {
-            Log.Debug($"[{type}] 已收到消息，当前队伍资料尚未就绪");
+            DebugLog($"[{type}] 已收到消息，当前队伍资料尚未就绪");
             return;
         }
 
@@ -295,12 +302,16 @@ public sealed class Plugin : IDalamudPlugin
         var error = string.Empty;
         try
         {
+            var historyStarted = Stopwatch.GetTimestamp();
             var history = await ReadHistoryAsync(scope, historyTurns).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
-            Log.Debug($"[{destination.LogChannel}] 开始向 API 请求回复（{server}，附带 {history.Length} 轮历史）");
+            var historyDetails = historyTurns <= 0 ? "对话缓存已关闭"
+                : scope is null ? "未识别会话"
+                : $"SQLite 历史 {history.Length} 轮，读取耗时 {Stopwatch.GetElapsedTime(historyStarted).TotalMilliseconds:F0} ms";
+            DebugLog($"[{destination.LogChannel}] 开始向 API 请求回复（{settings.Protocol}，{server}，{historyDetails}）");
             var result = await api.GenerateReplyAsync(settings, incoming, cancellationToken, history).ConfigureAwait(false);
             reply = result.Text;
-            Log.Debug($"[{destination.LogChannel}] API 响应成功（{result.Response}，{Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0} ms）");
+            DebugLog($"[{destination.LogChannel}] API 响应成功（{result.Response}，{Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0} ms）");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -326,7 +337,7 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         if (error.Length > 0)
-            error += $"，服务 {server}，耗时 {Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0} ms";
+            error += $"，协议 {settings.Protocol}，服务 {server}，耗时 {Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0} ms";
         completed.Enqueue(new CompletedReply(requestRevision, destination, scope, incoming, reply, error));
     }
 
@@ -339,7 +350,7 @@ public sealed class Plugin : IDalamudPlugin
         pending.Remove(destination.Key);
         if (result.Error.Length > 0)
         {
-            Log.Warning($"[{destination.LogChannel}] {result.Error}");
+            WarningLog($"[{destination.LogChannel}] {result.Error}");
             if (destination.Channel is null)
                 ChatGui.PrintError(result.Error, TestMessageTag);
             return;
@@ -352,7 +363,7 @@ public sealed class Plugin : IDalamudPlugin
             if (preview.Length > 0)
             {
                 PrintTestMessage(preview);
-                RecordHistory(result, preview);
+                _ = RecordHistoryAsync(result, preview);
             }
             else
                 ChatGui.PrintError("模型回复中没有可显示的文字。", TestMessageTag);
@@ -364,13 +375,13 @@ public sealed class Plugin : IDalamudPlugin
 
         if (destination.SourceType is { } source && destination.Group is { } group && !group.Matches(CaptureGroup(source)))
         {
-            Log.Debug($"[{destination.SourceType}] 队伍已变更或资料丢失，放弃发送");
+            DebugLog($"[{destination.SourceType}] 队伍已变更或资料丢失，放弃发送");
             return;
         }
 
         if (destination.Area is { } area && area != CaptureChatArea())
         {
-            Log.Debug($"[{destination.LogChannel}] 地图或实例已变更，放弃发送");
+            DebugLog($"[{destination.LogChannel}] 地图或实例已变更，放弃发送");
             return;
         }
 
@@ -386,12 +397,12 @@ public sealed class Plugin : IDalamudPlugin
         }
         catch (Exception ex)
         {
-            Log.Warning($"[{destination.SourceType}] 无法提交游戏聊天回复（{ex.GetType().Name}）");
+            WarningLog($"[{destination.SourceType}] 无法提交游戏聊天回复（{ex.GetType().Name}）");
             return;
         }
 
-        RecordHistory(result, reply);
-        Log.Debug($"[{destination.SourceType}] 已提交回复给游戏客户端");
+        _ = RecordHistoryAsync(result, reply);
+        DebugLog($"[{destination.SourceType}] 已提交回复给游戏客户端");
     }
 
     private async Task<ConversationTurn[]> ReadHistoryAsync(ConversationScope? scope, int maxTurns)
@@ -407,15 +418,30 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
-    private void RecordHistory(CompletedReply result, string reply) =>
-        _ = ObserveCacheOperationAsync(
-            conversations.RecordAsync(result.Scope, configuration.HistoryTurns, result.Incoming, reply), "写入");
+    private async Task RecordHistoryAsync(CompletedReply result, string reply)
+    {
+        try
+        {
+            var saved = await conversations.RecordAsync(result.Scope, configuration.HistoryTurns, result.Incoming, reply)
+                .ConfigureAwait(false);
+            if (saved is { } stats)
+            {
+                var replaced = stats.ReplacedContext ? "，已替换旧上下文" : string.Empty;
+                DebugLog($"[{result.Destination.LogChannel}] SQLite 对话已写入，裁剪 {stats.TrimmedTurns} 轮，移除 {stats.EvictedConversations} 个旧会话{replaced}");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogCacheFailure("写入", ex);
+        }
+    }
 
-    private static async Task<bool> ObserveCacheOperationAsync(Task operation, string action)
+    private async Task<bool> ObserveCacheOperationAsync(Task operation, string action)
     {
         try
         {
             await operation.ConfigureAwait(false);
+            DebugLog($"SQLite 对话缓存{action}完成");
             return true;
         }
         catch (Exception ex)
@@ -425,10 +451,22 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
-    private static void LogCacheFailure(string action, Exception exception)
+    private void LogCacheFailure(string action, Exception exception)
     {
         var reason = exception is SQLite.SQLiteException sqlite ? sqlite.Result.ToString() : exception.GetType().Name;
-        Log.Warning($"SQLite 对话缓存{action}失败（{reason}）");
+        WarningLog($"SQLite 对话缓存{action}失败（{reason}）");
+    }
+
+    private void DebugLog(string message)
+    {
+        if (loggingEnabled)
+            Log.Debug(message);
+    }
+
+    private void WarningLog(string message)
+    {
+        if (loggingEnabled)
+            Log.Warning(message);
     }
 
     internal static string FormatReply(string text, int maxCharacters, int maxBytes)
