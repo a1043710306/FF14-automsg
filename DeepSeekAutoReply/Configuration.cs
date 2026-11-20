@@ -31,6 +31,7 @@ public sealed class Configuration : IPluginConfiguration
     public int MaxReplyCharacters { get; set; } = 120;
     public int HistoryTurns { get; set; } = ConversationCache.MaxTurns;
     public bool LoggingEnabled { get; set; } = true;
+    public bool GameSearchEnabled { get; set; }
 
     internal void Upgrade()
     {

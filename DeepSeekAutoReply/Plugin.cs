@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -11,13 +12,18 @@ using System.Threading.Tasks;
 using Dalamud.Game.Chat;
 using Dalamud.Game.Command;
 using Dalamud.Game.Text;
+using Dalamud.Game.Text.SeStringHandling;
+using Dalamud.Game.Text.SeStringHandling.Payloads;
 using Dalamud.Interface.Windowing;
 using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
+using Dalamud.Utility;
 using FFXIVClientStructs.FFXIV.Client.System.String;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Info;
+using GameAction = Lumina.Excel.Sheets.Action;
+using GameEventItem = Lumina.Excel.Sheets.EventItem;
 
 namespace DeepSeekAutoReply;
 
@@ -29,17 +35,20 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IClientState ClientState { get; private set; } = null!;
     [PluginService] internal static IPlayerState PlayerState { get; private set; } = null!;
     [PluginService] internal static IPartyList PartyList { get; private set; } = null!;
+    [PluginService] internal static IDataManager DataManager { get; private set; } = null!;
     [PluginService] internal static IFramework Framework { get; private set; } = null!;
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
 
     private const string CommandName = "/dsreply";
     private const string TestCommandName = "/dstest";
+    private const string ItemTestCommandName = "/dsitem";
     private const string TestMessageTag = "DeepSeek 测试";
     private const int MaxChatBytes = 500;
     private static readonly ReplyDestination TestDestination = new("dstest", null, null, null, null);
 
     private readonly DeepSeekClient api = new();
     private readonly ConversationCache conversations;
+    private readonly Lazy<Task<ActionNameIndex>> actionNames;
     private readonly Dictionary<string, long> lastRequests = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> pending = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentQueue<CompletedReply> completed = new();
@@ -58,6 +67,7 @@ public sealed class Plugin : IDalamudPlugin
         ApplyConfiguration();
         var databasePath = Path.Combine(PluginInterface.ConfigDirectory.FullName, "conversation-cache.sqlite3");
         conversations = new ConversationCache(databasePath);
+        actionNames = new Lazy<Task<ActionNameIndex>>(() => Task.Run(BuildActionNameIndex));
         DebugLog($"SQLite 对话缓存路径 {databasePath}");
         configWindow = new ConfigWindow(this, configuration);
         windows.AddWindow(configWindow);
@@ -68,6 +78,10 @@ public sealed class Plugin : IDalamudPlugin
         CommandManager.AddHandler(TestCommandName, new CommandInfo(OnTestCommand)
         {
             HelpMessage = "测试已保存的 DeepSeek 配置，用法 /dstest [测试文本]",
+        });
+        CommandManager.AddHandler(ItemTestCommandName, new CommandInfo(OnItemTestCommand)
+        {
+            HelpMessage = "读取游戏客户端道具名称，用法 /dsitem 物品ID",
         });
         PluginInterface.UiBuilder.Draw += windows.Draw;
         PluginInterface.UiBuilder.OpenConfigUi += configWindow.Toggle;
@@ -85,6 +99,7 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.OpenConfigUi -= configWindow.Toggle;
         CommandManager.RemoveHandler(CommandName);
         CommandManager.RemoveHandler(TestCommandName);
+        CommandManager.RemoveHandler(ItemTestCommandName);
         windows.RemoveAllWindows();
         requests.Cancel();
         requests.Dispose();
@@ -103,7 +118,7 @@ public sealed class Plugin : IDalamudPlugin
         if (!wasLoggingEnabled && loggingEnabled)
             DebugLog($"SQLite 对话缓存路径 {conversations.DatabasePath}");
         ResetRequests();
-        if (!Equals(previousApiSettings, apiSettings))
+        if (previousApiSettings?.HistoryProfile != apiSettings?.HistoryProfile)
             _ = ObserveCacheOperationAsync(conversations.ClearAsync(), "清空");
         else if (previousLimit != configuration.HistoryTurns)
             _ = ObserveCacheOperationAsync(conversations.SetLimitAsync(configuration.HistoryTurns), "调整轮数");
@@ -152,6 +167,22 @@ public sealed class Plugin : IDalamudPlugin
         _ = GenerateAsync(settings, TestDestination, text, revision, requests.Token);
     }
 
+    private void OnItemTestCommand(string command, string args)
+    {
+        if (!uint.TryParse(args.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var rawId) || rawId == 0)
+        {
+            ChatGui.PrintError("输入物品 ID，例如 /dsitem 43543", TestMessageTag);
+            return;
+        }
+
+        var (id, kind) = ItemUtil.GetBaseId(rawId);
+        var name = ReadLocalItemName(new ItemPayload(id, kind));
+        if (string.IsNullOrWhiteSpace(name))
+            ChatGui.PrintError($"客户端未返回道具名称（ID {id}，{kind}）", TestMessageTag);
+        else
+            PrintTestMessage($"本地道具 ID {id}（{kind}）「{name}」");
+    }
+
     private static void PrintTestMessage(string text)
     {
         ChatGui.Print(new XivChatEntry
@@ -180,15 +211,15 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
-        var text = message.Message.TextValue.Trim();
-        if (text.Length == 0)
-            return;
-
         if (apiSettings is not { } settings)
         {
             DebugLog($"[{type}] 已收到消息，API 配置未就绪");
             return;
         }
+
+        var content = message.Message;
+        if (content.Payloads.Count == 0 && !message.MessageModified)
+            return;
 
         var isTell = channel == XivChatType.TellIncoming;
         var localPlayerLoaded = PlayerState.IsLoaded;
@@ -229,11 +260,69 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
+        var text = content.TextValue.Trim();
+        var links = ReadGameLinks(message, content);
+        if (text.Length == 0 && links.Count == 0)
+            return;
+
         var area = ChatRouting.UsesLocalArea(channel) ? CaptureChatArea() : (LocalChatArea?)null;
         var destination = new ReplyDestination(key, channel, type, senderName, group, area);
         lastRequests[key] = now;
         pending.Add(key);
-        _ = GenerateAsync(settings, destination, text, revision, requests.Token);
+        _ = GenerateAsync(settings, destination, text, revision, requests.Token, links);
+    }
+
+    private IReadOnlyList<GameReference> ReadGameLinks(IHandleableChatMessage message, SeString displayed)
+    {
+        var original = message.OriginalMessage;
+        var decoded = displayed;
+        if (message.MessageModified && !original.IsEmpty)
+        {
+            try
+            {
+                decoded = SeString.Parse(original.Data.Span);
+            }
+            catch (Exception ex)
+            {
+                DebugLog($"[{message.LogKind}] 原始聊天载荷解码失败（{ex.GetType().Name}）");
+            }
+        }
+
+        var references = new List<GameReference>();
+        foreach (var payload in decoded.Payloads)
+        {
+            try
+            {
+                if (payload is ItemPayload item)
+                {
+                    references.Add(new GameReference("道具", ReadLocalItemName(item) ?? string.Empty, item.ItemId));
+                }
+                else if (payload is QuestPayload quest)
+                {
+                    var row = quest.Quest;
+                    references.Add(new GameReference("任务", row.ValueNullable?.Name.ExtractText() ?? string.Empty, row.RowId));
+                }
+                else if (payload is StatusPayload status)
+                {
+                    var row = status.Status;
+                    references.Add(new GameReference("状态", row.ValueNullable?.Name.ExtractText() ?? string.Empty, row.RowId));
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog($"[{message.LogKind}] 本地游戏载荷读取失败（{payload.GetType().Name}，{ex.GetType().Name}）");
+            }
+        }
+
+        var links = GameChatText.ReadLinks(original.AsSpan(), ReadLocalItemName, references);
+        if (loggingEnabled && (links.Count > 0 || message.MessageModified || decoded.Payloads.Any(payload => payload is RawPayload)))
+        {
+            var types = string.Join("、", decoded.Payloads.Select(payload => payload.Type.ToString()).Distinct());
+            var ids = string.Join("、", links.Select(link =>
+                $"{link.Kind} ID {link.Id?.ToString(CultureInfo.InvariantCulture) ?? "无"}（{(link.Name.Length > 0 ? "有名称" : "无名称")}）"));
+            DebugLog($"[{message.LogKind}] 游戏链接识别 {links.Count} 条，Dalamud 解码 {references.Count} 条，载荷 {types} {ids}");
+        }
+        return links;
     }
 
     private static LocalChatArea CaptureChatArea() =>
@@ -292,16 +381,21 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     private async Task GenerateAsync(ApiSettings settings, ReplyDestination destination, string incoming, int requestRevision,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, IReadOnlyList<GameReference>? links = null)
     {
         var started = Stopwatch.GetTimestamp();
         var server = settings.Endpoint.GetLeftPart(UriPartial.Authority);
         var scope = destination.GetConversationScope(PlayerState.ContentId, settings.HistoryProfile);
         var historyTurns = configuration.HistoryTurns;
+        var modelInput = incoming;
         var reply = string.Empty;
         var error = string.Empty;
         try
         {
+            var matches = settings.GameSearchEnabled && incoming.Length > 0
+                ? (await actionNames.Value.WaitAsync(cancellationToken).ConfigureAwait(false)).Match(incoming)
+                : [];
+            modelInput = GameChatText.Enrich(incoming, links ?? [], matches);
             var historyStarted = Stopwatch.GetTimestamp();
             var history = await ReadHistoryAsync(scope, historyTurns).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
@@ -309,8 +403,12 @@ public sealed class Plugin : IDalamudPlugin
                 : scope is null ? "未识别会话"
                 : $"SQLite 历史 {history.Length} 轮，读取耗时 {Stopwatch.GetElapsedTime(historyStarted).TotalMilliseconds:F0} ms";
             DebugLog($"[{destination.LogChannel}] 开始向 API 请求回复（{settings.Protocol}，{server}，{historyDetails}）");
-            var result = await api.GenerateReplyAsync(settings, incoming, cancellationToken, history).ConfigureAwait(false);
+            var result = await api.GenerateReplyAsync(settings, modelInput, cancellationToken, history).ConfigureAwait(false);
             reply = result.Text;
+            if (settings.GameSearchEnabled)
+            {
+                DebugLog($"[{destination.LogChannel}] Garland Tools 查询 {result.Lookups} 次，未匹配 {result.LookupMisses} 次，末次 HTTP 状态 {result.DatabaseHttpStatus?.ToString() ?? "未知"}");
+            }
             DebugLog($"[{destination.LogChannel}] API 响应成功（{result.Response}，{Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0} ms）");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -319,7 +417,7 @@ public sealed class Plugin : IDalamudPlugin
         }
         catch (OperationCanceledException)
         {
-            error = "API 请求超时";
+            error = settings.GameSearchEnabled ? "AI 或资料查询超时" : "API 请求超时";
         }
         catch (ApiResponseException ex)
         {
@@ -338,7 +436,43 @@ public sealed class Plugin : IDalamudPlugin
 
         if (error.Length > 0)
             error += $"，协议 {settings.Protocol}，服务 {server}，耗时 {Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0} ms";
-        completed.Enqueue(new CompletedReply(requestRevision, destination, scope, incoming, reply, error));
+        completed.Enqueue(new CompletedReply(requestRevision, destination, scope, modelInput, reply, error));
+    }
+
+    private string? ReadLocalItemName(ItemPayload payload)
+    {
+        try
+        {
+            var language = DataManager.Language;
+            var name = ItemUtil.GetItemName(payload.RawItemId, includeIcon: false, language: language).ExtractText();
+            if (string.IsNullOrWhiteSpace(name) && payload.RawItemId >= (uint)ItemKind.EventItem
+                && DataManager.GetExcelSheet<GameEventItem>(language).TryGetRow(payload.RawItemId, out var eventItem))
+                name = (eventItem.Name.IsEmpty ? eventItem.Singular : eventItem.Name).ExtractText();
+            if (!string.IsNullOrWhiteSpace(name))
+                return name;
+
+            DebugLog($"客户端没有返回道具 ID {payload.ItemId} 的名称（{payload.Kind}）");
+        }
+        catch (Exception ex)
+        {
+            WarningLog($"无法读取本地道具 ID {payload.ItemId}（{ex.GetType().Name}）");
+        }
+        return payload.DisplayName;
+    }
+
+    private ActionNameIndex BuildActionNameIndex()
+    {
+        try
+        {
+            var sheet = DataManager.GetExcelSheet<GameAction>();
+            return new ActionNameIndex(sheet.Where(action => action.IsPlayerAction)
+                .Select(action => new GameReference("技能", action.Name.ExtractText(), action.RowId)));
+        }
+        catch (Exception ex)
+        {
+            WarningLog($"无法读取游戏技能名称（{ex.GetType().Name}）");
+            return new ActionNameIndex([]);
+        }
     }
 
     private void OnUpdate(IFramework framework)

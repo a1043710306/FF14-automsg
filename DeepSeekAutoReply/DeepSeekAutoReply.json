@@ -5,6 +5,6 @@
   "DalamudApiLevel": 15,
   "ApplicableVersion": "any",
   "Punchline": "使用 DeepSeek 自动回复可选的玩家聊天频道",
-  "Description": "支持 Chat Completions 和 Responses，使用 SQLite 按角色、发送者和频道保存多轮对话。输入 /dsreply 设置，输入 /dstest 测试。",
+  "Description": "支持 Chat Completions、Responses、SQLite 多轮对话和 Garland Tools 国服资料查询。输入 /dsreply 设置，输入 /dstest 测试。",
   "Tags": ["DeepSeek", "chat", "自动回复"]
 }

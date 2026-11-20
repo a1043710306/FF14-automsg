@@ -24,6 +24,16 @@ dotnet build .\DeepSeekAutoReply\DeepSeekAutoReply.csproj -c Release
 
 插件跳过当前角色自己发出的消息。说话、呼喊和喊话的回复会在原地图和实例内提交。Token 保存在本机 Dalamud 插件配置文件中。接口失败时可在 `/xllog` 查看错误，日志省略密钥和聊天内容。
 
+## 查询游戏资料
+
+插件使用 Dalamud 解码的 `ItemPayload`、`QuestPayload` 和 `StatusPayload` 读取道具、任务和状态的 ID 与客户端名称。原始聊天宏可补充名称、成就和情感动作。消息被改写时，插件会重新解码原始载荷。启用「Garland Tools 查询」后，插件会匹配游戏数据表中的技能名称，AI 可根据上下文决定是否查询。查询会把游戏内容名称或 ID 发送到 Garland Tools 中文数据库。Chat Completions 和 Responses 都可使用。[Garland Tools 中文数据库](https://garlandtools.cn/db/)
+
+读取道具名称时，插件把链接中的 `RawItemId` 交给 `ItemUtil.GetItemName`。该接口会处理 HQ、收藏品和任务道具，并为简体中文任务道具读取 `EventItem.Singular`。普通道具的说明、品级和基础属性可按 `ItemId` 从 `IDataManager.GetExcelSheet<Item>()` 读取。[ItemUtil 源码](https://github.com/ottercorp/Dalamud/blob/15.0.4.0/Dalamud/Utility/ItemUtil.cs) · [IDataManager 源码](https://github.com/ottercorp/Dalamud/blob/15.0.4.0/Dalamud/Plugin/Services/IDataManager.cs)
+
+保存设置后，可输入 `/dstest 查一下轻量级全息投影手铠（ID 43543）怎么用`。开启日志时，在 `/xllog` 的 Debug 级别搜索 `Garland Tools`，可查看查询次数、未匹配次数及末次数据库 HTTP 状态。
+
+输入 `/dsitem 43543` 可单独检查游戏客户端返回的名称。要检查真实聊天链接，请让队友发送一条「展示道具」，在 `/xllog` 的 Debug 级别搜索「游戏链接识别」，查看解码数量、载荷类型、ID 和名称是否读到。`/dstest` 用于测试文本和 AI 请求。
+
 ## 多轮对话
 
 缓存按游戏发送者昵称和频道区分。获取到服务器名时，会用 `昵称@服务器` 区分同名角色。私聊、不同公开频道和 `/dstest` 各自保留上下文。插件请求 API 时会带上该会话的历史和系统提示词，只缓存已提交给游戏客户端的回复或已显示的测试回复。

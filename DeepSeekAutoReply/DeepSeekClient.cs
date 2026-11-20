@@ -11,7 +11,8 @@ using System.Threading.Tasks;
 
 namespace DeepSeekAutoReply;
 
-internal sealed record ApiSettings(Uri Endpoint, string Token, string Model, string SystemPrompt, ApiProtocol Protocol)
+internal sealed record ApiSettings(Uri Endpoint, string Token, string Model, string SystemPrompt, ApiProtocol Protocol,
+    bool GameSearchEnabled)
 {
     private const string ChatEndpoint = "/chat/completions";
     private const string ResponsesEndpoint = "/responses";
@@ -61,14 +62,16 @@ internal sealed record ApiSettings(Uri Endpoint, string Token, string Model, str
         {
             Path = path.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) ? path : path + suffix,
         }.Uri;
-        settings = new ApiSettings(endpoint, token, model, config.SystemPrompt ?? string.Empty, config.Protocol);
+        settings = new ApiSettings(endpoint, token, model, config.SystemPrompt ?? string.Empty, config.Protocol, config.GameSearchEnabled);
         error = string.Empty;
         return true;
     }
 }
 
-internal sealed class DeepSeekClient : IDisposable
+internal sealed class DeepSeekClient(GarlandSearch? search = null) : IDisposable
 {
+    private const int MaxToolRounds = 2;
+    private const int MaxLookups = 3;
     private static readonly JsonSerializerOptions RequestJsonOptions = new()
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
@@ -79,19 +82,23 @@ internal sealed class DeepSeekClient : IDisposable
         Timeout = TimeSpan.FromSeconds(30),
         MaxResponseContentBufferSize = 1024 * 1024,
     };
+    private readonly GarlandSearch garland = search ?? new GarlandSearch();
 
     public async Task<ApiReply> GenerateReplyAsync(ApiSettings settings, string incoming, CancellationToken cancellationToken,
         IReadOnlyList<ConversationTurn>? history = null)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Post, settings.Endpoint);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.Token);
-        var isOfficialDeepSeek = settings.Endpoint.IdnHost == "api.deepseek.com";
-        var useOfficialFlash = isOfficialDeepSeek && settings.Model == "deepseek-flash";
+        using var deadline = settings.GameSearchEnabled ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken) : null;
+        deadline?.CancelAfter(TimeSpan.FromSeconds(40));
+        var token = deadline?.Token ?? cancellationToken;
+        var lookups = 0;
+        var misses = 0;
+        int? databaseStatus = null;
         var useResponses = settings.Protocol == ApiProtocol.Responses;
         var messageType = useResponses ? "message" : null;
-        var messages = new List<ApiMessage>((history?.Count ?? 0) * 2 + 2);
+        var prompt = settings.GameSearchEnabled ? $"{settings.SystemPrompt}\n\n{GarlandTool.Instructions}" : settings.SystemPrompt;
+        var messages = new List<object>((history?.Count ?? 0) * 2 + 2);
         if (!useResponses)
-            messages.Add(new ApiMessage("system", settings.SystemPrompt));
+            messages.Add(new ApiMessage("system", prompt));
 
         if (history is not null)
         {
@@ -103,16 +110,60 @@ internal sealed class DeepSeekClient : IDisposable
         }
         messages.Add(new ApiMessage("user", incoming, messageType));
 
-        request.Content = useResponses
+        for (var round = 0; ; round++)
+        {
+            var canCall = settings.GameSearchEnabled && round < MaxToolRounds && lookups < MaxLookups;
+            var (root, details) = await SendAsync(settings, CreateContent(settings, messages, prompt, canCall), token)
+                .ConfigureAwait(false);
+            var calls = settings.GameSearchEnabled ? ReadToolCalls(root, details, useResponses, messages) : [];
+            if (calls.Count == 0)
+            {
+                var text = useResponses ? ReadResponsesReply(root, details) : ReadChatReply(root, details);
+                return new ApiReply(text, details, lookups, misses, databaseStatus);
+            }
+            if (!canCall)
+                throw new ApiResponseException(details, "模型超出了资料查询次数上限");
+
+            foreach (var call in calls)
+            {
+                GarlandResult result;
+                if (call.Name != GarlandTool.Name || !GarlandTool.TryGetQuery(call.Arguments, out var query))
+                    result = new GarlandResult([], null, "无效的 Garland Tools 查询");
+                else if (lookups >= MaxLookups)
+                    result = new GarlandResult([], null, "本次回复的资料查询次数已用完");
+                else
+                {
+                    lookups++;
+                    result = await garland.SearchAsync(query, token).ConfigureAwait(false);
+                    databaseStatus = result.HttpStatus;
+                    if (result.Entries.Count == 0)
+                        misses++;
+                }
+
+                messages.Add(useResponses
+                    ? new { type = "function_call_output", call_id = call.Id, output = result.ToToolOutput() }
+                    : new { role = "tool", tool_call_id = call.Id, content = result.ToToolOutput() });
+            }
+        }
+    }
+
+    private static JsonContent CreateContent(ApiSettings settings, List<object> messages, string prompt, bool canCall)
+    {
+        var isOfficialDeepSeek = settings.Endpoint.IdnHost == "api.deepseek.com";
+        var useOfficialFlash = isOfficialDeepSeek && settings.Model == "deepseek-flash";
+        var toolChoice = settings.GameSearchEnabled ? (canCall ? "auto" : "none") : null;
+        return settings.Protocol == ApiProtocol.Responses
             ? JsonContent.Create(new
             {
                 model = settings.Model,
-                instructions = string.IsNullOrWhiteSpace(settings.SystemPrompt) ? null : settings.SystemPrompt,
+                instructions = string.IsNullOrWhiteSpace(prompt) ? null : prompt,
                 input = messages,
                 max_output_tokens = 1024,
                 stream = false,
                 store = isOfficialDeepSeek ? (bool?)null : false,
                 reasoning = useOfficialFlash ? new { effort = "none" } : null,
+                tools = settings.GameSearchEnabled ? GarlandTool.ResponsesDefinition : null,
+                tool_choice = toolChoice,
             }, options: RequestJsonOptions)
             : JsonContent.Create(new
             {
@@ -120,8 +171,18 @@ internal sealed class DeepSeekClient : IDisposable
                 max_tokens = 1024,
                 stream = false,
                 thinking = useOfficialFlash ? new { type = "disabled" } : null,
+                tools = settings.GameSearchEnabled ? GarlandTool.ChatDefinition : null,
+                tool_choice = toolChoice,
                 messages,
             }, options: RequestJsonOptions);
+    }
+
+    private async Task<(JsonElement Root, ApiResponseDetails Details)> SendAsync(ApiSettings settings, JsonContent content,
+        CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, settings.Endpoint);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.Token);
+        request.Content = content;
         using var response = await http.SendAsync(request, cancellationToken).ConfigureAwait(false);
         var body = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
         var jsonBytes = body.AsMemory(body.AsSpan().StartsWith("\uFEFF"u8) ? 3 : 0);
@@ -139,8 +200,7 @@ internal sealed class DeepSeekClient : IDisposable
             if (root.ValueKind != JsonValueKind.Object)
                 throw new ApiResponseException(details, "响应 JSON 的根节点不是对象");
 
-            var content = useResponses ? ReadResponsesReply(root, details) : ReadChatReply(root, details);
-            return new ApiReply(content, details);
+            return (root.Clone(), details);
         }
         catch (JsonException ex)
         {
@@ -151,9 +211,28 @@ internal sealed class DeepSeekClient : IDisposable
         }
     }
 
-    public void Dispose() => http.Dispose();
+    public void Dispose()
+    {
+        http.Dispose();
+        garland.Dispose();
+    }
 
     private static string ReadChatReply(JsonElement root, ApiResponseDetails details)
+    {
+        var message = ChatMessage(root, details);
+        if (!message.TryGetProperty("content", out var content))
+            throw new ApiResponseException(details, "响应缺少 choices[0].message.content");
+        if (content.ValueKind is not (JsonValueKind.String or JsonValueKind.Null))
+            throw new ApiResponseException(details, "choices[0].message.content 不是字符串");
+
+        var reply = content.GetString();
+        if (string.IsNullOrWhiteSpace(reply))
+            throw new ApiResponseException(details, "模型返回了空回复");
+
+        return reply;
+    }
+
+    private static JsonElement ChatMessage(JsonElement root, ApiResponseDetails details)
     {
         if (!root.TryGetProperty("choices", out var choices) || choices.ValueKind != JsonValueKind.Array)
         {
@@ -166,20 +245,12 @@ internal sealed class DeepSeekClient : IDisposable
 
         var choice = choices[0];
         if (choice.ValueKind != JsonValueKind.Object || !choice.TryGetProperty("message", out var message)
-            || message.ValueKind != JsonValueKind.Object || !message.TryGetProperty("content", out var content))
-            throw new ApiResponseException(details, "响应缺少 choices[0].message.content");
-
-        if (content.ValueKind is not (JsonValueKind.String or JsonValueKind.Null))
-            throw new ApiResponseException(details, "choices[0].message.content 不是字符串");
-
-        var reply = content.GetString();
-        if (string.IsNullOrWhiteSpace(reply))
-            throw new ApiResponseException(details, "模型返回了空回复");
-
-        return reply;
+            || message.ValueKind != JsonValueKind.Object)
+            throw new ApiResponseException(details, "响应缺少 choices[0].message");
+        return message;
     }
 
-    private static string ReadResponsesReply(JsonElement root, ApiResponseDetails details)
+    private static void ValidateResponsesStatus(JsonElement root, ApiResponseDetails details)
     {
         var status = StringField(root, "status");
         if (status is "failed" or "cancelled" || root.TryGetProperty("error", out var error)
@@ -195,6 +266,61 @@ internal sealed class DeepSeekClient : IDisposable
             var suffix = reason is "max_output_tokens" or "content_filter" ? $"（{reason}）" : string.Empty;
             throw new ApiResponseException(details, $"Responses API 返回了未完成的回复{suffix}");
         }
+    }
+
+    private static List<ToolCall> ReadToolCalls(JsonElement root, ApiResponseDetails details, bool useResponses, List<object> messages)
+    {
+        var calls = new List<ToolCall>();
+        if (useResponses)
+        {
+            ValidateResponsesStatus(root, details);
+            if (!root.TryGetProperty("output", out var output) || output.ValueKind != JsonValueKind.Array)
+                return calls;
+
+            foreach (var item in output.EnumerateArray())
+            {
+                if (StringField(item, "type") == "function_call")
+                    calls.Add(CreateToolCall(item, "call_id", item, details));
+            }
+            if (calls.Count > 0)
+            {
+                foreach (var item in output.EnumerateArray())
+                    messages.Add(item);
+            }
+        }
+        else
+        {
+            var message = ChatMessage(root, details);
+            if (!message.TryGetProperty("tool_calls", out var requested) || requested.ValueKind != JsonValueKind.Array)
+                return calls;
+
+            foreach (var item in requested.EnumerateArray())
+            {
+                var function = item.ValueKind == JsonValueKind.Object && item.TryGetProperty("function", out var value) ? value : default;
+                calls.Add(CreateToolCall(item, "id", function, details));
+            }
+            if (calls.Count > 0)
+                messages.Add(new { role = "assistant", content = StringField(message, "content"), tool_calls = requested,
+                    reasoning_content = StringField(message, "reasoning_content") });
+        }
+
+        if (calls.Count > 8)
+            throw new ApiResponseException(details, "模型一次返回了过多工具调用");
+        return calls;
+    }
+
+    private static ToolCall CreateToolCall(JsonElement item, string idField, JsonElement function, ApiResponseDetails details)
+    {
+        var id = StringField(item, idField);
+        if (string.IsNullOrEmpty(id) || id.Length > 128)
+            throw new ApiResponseException(details, "模型工具调用 ID 无效");
+
+        return new ToolCall(id, StringField(function, "name"), StringField(function, "arguments"));
+    }
+
+    private static string ReadResponsesReply(JsonElement root, ApiResponseDetails details)
+    {
+        ValidateResponsesStatus(root, details);
 
         var parts = new List<string>();
         var refused = false;
@@ -253,9 +379,10 @@ internal sealed class DeepSeekClient : IDisposable
 
     private sealed record ApiMessage([property: JsonPropertyName("role")] string Role,
         [property: JsonPropertyName("content")] string Content, [property: JsonPropertyName("type")] string? Type = null);
+    private sealed record ToolCall(string Id, string? Name, string? Arguments);
 }
 
-internal sealed record ApiReply(string Text, ApiResponseDetails Response);
+internal sealed record ApiReply(string Text, ApiResponseDetails Response, int Lookups, int LookupMisses, int? DatabaseHttpStatus);
 
 internal sealed record ApiResponseDetails(int StatusCode, string ContentType, int BodyBytes, string BodyFormat)
 {

@@ -22,6 +22,7 @@ internal sealed class ConfigWindow : Window
     private int maxCharacters;
     private int historyTurns;
     private bool loggingEnabled;
+    private bool gameSearchEnabled;
     private string status = string.Empty;
     private Task<bool>? clearingHistory;
 
@@ -39,6 +40,7 @@ internal sealed class ConfigWindow : Window
         maxCharacters = Math.Clamp(config.MaxReplyCharacters, 20, 500);
         historyTurns = Math.Clamp(config.HistoryTurns, 0, ConversationCache.MaxTurns);
         loggingEnabled = config.LoggingEnabled;
+        gameSearchEnabled = config.GameSearchEnabled;
         Size = new Vector2(645, 610);
         SizeCondition = ImGuiCond.FirstUseEver;
     }
@@ -78,6 +80,7 @@ internal sealed class ConfigWindow : Window
         ImGui.SliderInt("最大回复字数", ref maxCharacters, 20, 500);
         ImGui.InputInt("缓存对话轮数（0–1000）", ref historyTurns);
         ImGui.Checkbox("启用插件日志", ref loggingEnabled);
+        ImGui.Checkbox("启用 Garland Tools 查询", ref gameSearchEnabled);
         if (ImGui.SmallButton("清空对话缓存") && clearingHistory is null)
         {
             clearingHistory = plugin.ClearConversationHistory();
@@ -138,6 +141,7 @@ internal sealed class ConfigWindow : Window
             MaxReplyCharacters = maxCharacters,
             HistoryTurns = historyTurns,
             LoggingEnabled = loggingEnabled,
+            GameSearchEnabled = gameSearchEnabled,
         };
         if (updated.ApiToken.Length > 0 && channels.Count > 0
             && !ApiSettings.TryCreate(updated, out _, out status))
